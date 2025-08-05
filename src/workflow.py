@@ -2,21 +2,37 @@ from typing import Dict, Any
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from .model import CompanyAnalysis, CompanyInfo, ResearchState
+from .models import CompanyAnalysis, CompanyInfo, ResearchState
 from .firecrawl import FirecrawlService
 from .prompts import DeveloperToolsPrompts
+import os
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 class Workflow:
     def __init__(self):
         self.firecrawl = FirecrawlService()
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+        self.llm = ChatOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        model_name="openai/gpt-4o-mini",
+        timeout=30,  # Add timeout
+        max_retries=3,  # Add retry logic
+        temperature=0.1)
         self.prompts = DeveloperToolsPrompts()
 
         self.workflow = self.build_workflow()
     
     def build_workflow(self):
-        pass
+        graph = StateGraph(ResearchState)
+        graph.add_node("extract_tools", self._extract_tools_step)
+        graph.add_node("research", self._research_step)
+        graph.add_node("analyze", self._analyze_step)
+        graph.set_entry_point("extract_tools")
+        graph.add_edge("extract_tools", "research")
+        graph.add_edge("research", "analyze")
+        graph.add_edge("analyze", END)
+        return graph.compile()
 
     def _extract_tools_step(self, state: ResearchState) -> Dict[str, Any]:
         print(f"Finding articles about: {state.query}")
@@ -34,7 +50,7 @@ class Workflow:
                 all_content + scraped.markdown[:1500] + "\n\n"
         
         messages = [
-            SystemMassage(content = self.prompts.TOOL_EXTRACTION_SYSTEM),
+            SystemMessage(content = self.prompts.TOOL_EXTRACTION_SYSTEM),
             HumanMessage(content=self.prompts.tool_extraction_user(state.query, all_content))
         ]
 
@@ -123,3 +139,23 @@ class Workflow:
 
                 companies.append(company)
         return {"companies": companies}
+    
+    def _analyze_step(self, state: ResearchState) -> Dict[str, Any]:
+        print("Generating recommendations")
+
+        company_data = ",".join([
+            company.json() for company in state.companies
+        ])
+
+        messages=[
+            SystemMessage(content=self.prompts.RECOMMENDATION_SYSTEM),
+            HumanMessage(content=self.prompts.recommandation_user(state.query, company_data))
+        ]
+
+        response = self.llm.invoke(messages)
+        return {"analysis": response.content}
+    
+    def run(self,query)-> ResearchState:
+        initial_state = ResearchState(query=query)
+        final_state = self.workflow.invoke(initial_state)
+        return ResearchState(**final_state)
